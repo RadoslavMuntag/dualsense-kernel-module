@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# Ubuntu 24.04 VM for kernel module development (QEMU/KVM, headless, SSH on localhost).
+set -euo pipefail
+
+# Remembered so that paths given to 'sync' resolve from where the user ran us.
+CALLER_PWD=$PWD
+cd "$(dirname "$(readlink -f "$0")")"
+
+BASE=noble-server-cloudimg-amd64.img
+DISK=disk.qcow2
+SEED=seed.iso
+PIDFILE=qemu.pid
+CONSOLE_LOG=console.log
+KNOWN_HOSTS=known_hosts
+
+CPUS=${VM_CPUS:-4}
+MEM=${VM_MEM:-4G}
+DISK_SIZE=${VM_DISK_SIZE:-30G}
+SSH_PORT=${VM_SSH_PORT:-2222}
+SSH_KEY=${VM_SSH_KEY:-$HOME/.ssh/id_ed25519}
+# Host USB devices handed to the guest, as space-separated vendor:product IDs.
+# Default is the DualSense controller; set VM_USB="" to pass nothing through.
+USB_PASS=${VM_USB-054c:0ce6}
+
+SSH_OPTS=(-p "$SSH_PORT" -i "$SSH_KEY"
+  -o UserKnownHostsFile="$PWD/$KNOWN_HOSTS"
+  -o StrictHostKeyChecking=accept-new
+  -o LogLevel=ERROR)
+
+running() { [[ -f $PIDFILE ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+
+need_qemu() {
+  command -v qemu-system-x86_64 >/dev/null && command -v qemu-img >/dev/null && return
+  echo "QEMU is not installed. Run: sudo pacman -S qemu-base" >&2
+  exit 1
+}
+
+# cloud-init reads its config from a volume labelled CIDATA.
+make_seed() {
+  local tmp
+  tmp=$(mktemp -d)
+  cat >"$tmp/meta-data" <<EOF
+instance-id: kmod-dev-$(date +%s)
+local-hostname: kmod-dev
+EOF
+  cat >"$tmp/user-data" <<EOF
+#cloud-config
+users:
+  - name: ubuntu
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    ssh_authorized_keys:
+      - $(cat "$SSH_KEY.pub")
+chpasswd:
+  expire: false
+  users:
+    - {name: ubuntu, password: ubuntu, type: text}
+ssh_pwauth: false
+package_update: true
+packages:
+  - build-essential
+  - git
+  - kmod
+runcmd:
+  # Headers must match the running kernel exactly, or modules won't build/load.
+  - apt-get install -y "linux-headers-\$(uname -r)"
+  - touch /var/lib/cloud/kmod-dev-ready
+EOF
+  bsdtar -cf "$SEED" --format=iso9660 --options 'iso9660:volume-id=CIDATA' \
+    -C "$tmp" user-data meta-data
+  rm -rf "$tmp"
+}
+
+create() {
+  [[ -f $BASE ]] || { echo "Missing $BASE (download it from cloud-images.ubuntu.com/noble/current)" >&2; exit 1; }
+  [[ -f $SSH_KEY.pub ]] || { echo "Missing SSH public key $SSH_KEY.pub" >&2; exit 1; }
+  qemu-img create -q -f qcow2 -b "$BASE" -F qcow2 "$DISK" "$DISK_SIZE"
+  make_seed
+  rm -f "$KNOWN_HOSTS"
+}
+
+# Builds the -device options for USB passthrough into USB_ARGS. A device that
+# can't be passed through only produces a warning, so the VM still boots.
+usb_args() {
+  USB_ARGS=()
+  [[ -n $USB_PASS ]] || return 0
+  if [[ $(qemu-system-x86_64 -device help) != *'"usb-host"'* ]]; then
+    echo "warning: no USB passthrough support in QEMU; run: sudo pacman -S qemu-hw-usb-host" >&2
+    return 0
+  fi
+  local id vid pid dev node
+  for id in $USB_PASS; do
+    vid=${id%%:*} pid=${id##*:}
+    USB_ARGS+=(-device "usb-host,vendorid=0x$vid,productid=0x$pid")
+    for dev in /sys/bus/usb/devices/*; do
+      [[ -f $dev/idVendor && $(<"$dev/idVendor") == "$vid" && $(<"$dev/idProduct") == "$pid" ]] || continue
+      node=$(printf '/dev/bus/usb/%03d/%03d' "$(<"$dev/busnum")" "$(<"$dev/devnum")")
+      [[ -w $node ]] || echo "warning: no write access to $node ($id); see VM.md, USB passthrough" >&2
+      continue 2
+    done
+    echo "note: USB device $id is not plugged in; it will attach to the VM when connected" >&2
+  done
+}
+
+cmd_start() {
+  need_qemu
+  if running; then echo "Already running (pid $(cat "$PIDFILE"))"; return; fi
+  [[ -f $DISK ]] || create
+  usb_args
+  qemu-system-x86_64 \
+    -name kmod-dev \
+    -machine q35,accel=kvm -cpu host -smp "$CPUS" -m "$MEM" \
+    -drive file="$DISK",if=virtio,format=qcow2 \
+    -drive file="$SEED",if=virtio,format=raw,readonly=on \
+    -nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:"$SSH_PORT"-:22 \
+    -device qemu-xhci "${USB_ARGS[@]}" \
+    -display none -serial file:"$CONSOLE_LOG" \
+    -daemonize -pidfile "$PIDFILE"
+  echo "Started (pid $(cat "$PIDFILE")). Waiting for SSH..."
+  for _ in $(seq 90); do
+    if ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 -o BatchMode=yes ubuntu@127.0.0.1 true 2>/dev/null; then
+      echo "Up. Connect with: ./vm ssh"
+      return
+    fi
+    sleep 2
+  done
+  echo "SSH did not come up in time; check ./vm log" >&2
+  exit 1
+}
+
+cmd_ssh() { exec ssh "${SSH_OPTS[@]}" ubuntu@127.0.0.1 "$@"; }
+
+cmd_stop() {
+  running || { echo "Not running"; rm -f "$PIDFILE"; return; }
+  local pid
+  pid=$(cat "$PIDFILE")
+  ssh "${SSH_OPTS[@]}" -o ConnectTimeout=3 -o BatchMode=yes ubuntu@127.0.0.1 sudo poweroff 2>/dev/null || true
+  for _ in $(seq 30); do
+    kill -0 "$pid" 2>/dev/null || { echo "Stopped"; rm -f "$PIDFILE"; return; }
+    sleep 1
+  done
+  # Guest is hung (e.g. a module panicked the kernel): pull the plug.
+  kill "$pid" && echo "Killed (guest did not shut down cleanly)"
+  rm -f "$PIDFILE"
+}
+
+cmd_status() {
+  if running; then echo "running (pid $(cat "$PIDFILE"), ssh port $SSH_PORT)"; else echo "stopped"; fi
+}
+
+cmd_log() { exec tail -n "${1:-50}" -f "$CONSOLE_LOG"; }
+
+cmd_reset() {
+  running && cmd_stop
+  rm -f "$DISK" "$SEED" "$KNOWN_HOSTS" "$CONSOLE_LOG"
+  echo "VM disk deleted; next './vm start' builds a fresh one"
+}
+
+has_snapshot() {
+  qemu-img snapshot -U -l "$DISK" | awk -v n="$1" 'NR > 2 && $2 == n { found = 1 } END { exit !found }'
+}
+
+# Snapshots are stored inside disk.qcow2 and can only be changed while QEMU
+# is not using the image, so create/revert stop the VM and boot it again.
+cmd_snapshot() {
+  need_qemu
+  local action=${1:-list} name=${2:-} was_running=0
+  [[ -f $DISK ]] || { echo "No VM disk yet; run ./vm start first" >&2; exit 1; }
+  case "$action" in
+    list)
+      qemu-img snapshot -U -l "$DISK" | grep . || echo "No snapshots"
+      return ;;
+    create)
+      name=${name:-$(date +%Y%m%d-%H%M%S)}
+      if has_snapshot "$name"; then echo "Snapshot '$name' already exists" >&2; exit 1; fi ;;
+    revert|delete)
+      [[ -n $name ]] || { echo "Usage: ./vm snapshot $action <name>" >&2; exit 1; }
+      has_snapshot "$name" || { echo "No snapshot named '$name' (see ./vm snapshot list)" >&2; exit 1; } ;;
+    *)
+      echo "Usage: ./vm snapshot [list | create [name] | revert <name> | delete <name>]" >&2
+      exit 1 ;;
+  esac
+  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Snapshot names may only contain letters, digits, '.', '_' and '-'" >&2; exit 1; }
+
+  if running; then
+    was_running=1
+    if [[ $action == revert ]]; then
+      # The current disk state is about to be thrown away; no need for a clean shutdown.
+      kill "$(cat "$PIDFILE")"
+      while running; do sleep 0.2; done
+      rm -f "$PIDFILE"
+    else
+      cmd_stop
+    fi
+  fi
+
+  case "$action" in
+    create)
+      qemu-img snapshot -c "$name" "$DISK"
+      echo "Created snapshot '$name'" ;;
+    revert)
+      qemu-img snapshot -a "$name" "$DISK"
+      echo "Reverted to snapshot '$name'" ;;
+    delete)
+      qemu-img snapshot -d "$name" "$DISK"
+      echo "Deleted snapshot '$name'" ;;
+  esac
+
+  if ((was_running)); then cmd_start; fi
+}
+
+# Mirrors a host directory into the guest's home directory. Build products in
+# the guest are left alone, so a sync doesn't force a full rebuild.
+cmd_sync() {
+  local src=${1:-} dest
+  [[ -n $src ]] || { echo "Usage: ./vm sync <dir> [name-in-guest]" >&2; exit 1; }
+  command -v rsync >/dev/null || { echo "rsync is not installed. Run: sudo pacman -S rsync" >&2; exit 1; }
+  src=$(cd "$CALLER_PWD" && realpath -e -- "$src") || exit 1
+  [[ -d $src ]] || { echo "Not a directory: $src" >&2; exit 1; }
+  dest=${2:-$(basename "$src")}
+  [[ $dest =~ ^[A-Za-z0-9._-]+$ && $dest != . && $dest != .. ]] ||
+    { echo "Guest directory name may only contain letters, digits, '.', '_' and '-'" >&2; exit 1; }
+  running || { echo "VM is not running; run ./vm start first" >&2; exit 1; }
+  # No -t: a changed file gets the guest's current time, so make always sees it
+  # as newer than its object file. -c compares content, so unchanged files are
+  # left alone and are not rebuilt.
+  rsync -rlpcz --delete --itemize-changes \
+    --exclude='.git/' --exclude='*.o' --exclude='*.ko' --exclude='*.mod' --exclude='*.mod.c' \
+    --exclude='.*.cmd' --exclude='Module.symvers' --exclude='modules.order' \
+    -e "ssh $(printf '%q ' "${SSH_OPTS[@]}")" \
+    "$src/" "ubuntu@127.0.0.1:$dest/"
+  echo "Synced $src -> ~/$dest in the VM"
+}
+
+# Copies the running guest kernel's headers to kernel-headers/ on the host, so
+# host tools (clangd, checkpatch.pl) see the same headers the module builds against.
+cmd_headers() {
+  command -v rsync >/dev/null || { echo "rsync is not installed. Run: sudo pacman -S rsync" >&2; exit 1; }
+  running || { echo "VM is not running; run ./vm start first" >&2; exit 1; }
+  local rel
+  rel=$(ssh "${SSH_OPTS[@]}" ubuntu@127.0.0.1 uname -r)
+  mkdir -p kernel-headers
+  # Ubuntu splits headers in two: a per-flavour directory that links into a shared one.
+  rsync -a --delete -e "ssh $(printf '%q ' "${SSH_OPTS[@]}")" \
+    "ubuntu@127.0.0.1:/usr/src/linux-headers-$rel" \
+    "ubuntu@127.0.0.1:/usr/src/linux-headers-${rel%-generic}" kernel-headers/
+  ln -sfn "linux-headers-$rel" kernel-headers/current
+  echo "Headers for $rel are in $PWD/kernel-headers/current"
+}
+
+case "${1:-}" in
+  start)  cmd_start ;;
+  headers) cmd_headers ;;
+  sync)   shift; cmd_sync "$@" ;;
+  snapshot) shift; cmd_snapshot "$@" ;;
+  stop)   cmd_stop ;;
+  ssh)    shift; cmd_ssh "$@" ;;
+  status) cmd_status ;;
+  log)    shift; cmd_log "$@" ;;
+  reset)  cmd_reset ;;
+  *)
+    cat <<EOF
+Usage: ./vm <command>
+  start    boot the VM (creates it on first run) and wait for SSH
+  ssh      open a shell in the VM, or run a command: ./vm ssh uname -r
+  stop     shut the VM down (kills it if the guest kernel is hung)
+  status   show whether the VM is running
+  log      follow the guest serial console (kernel panics/oopses land here)
+  reset    delete the VM disk and start over from a clean Ubuntu image
+  headers  copy the guest's kernel headers to kernel-headers/ for host editor tooling
+  sync <dir> [name]        mirror a host directory to ~/<name> in the VM
+                           (default name: the directory's own name)
+  snapshot list            show saved snapshots
+  snapshot create [name]   save the current disk state (default name: timestamp)
+  snapshot revert <name>   discard the current disk state and go back to a snapshot
+  snapshot delete <name>   remove a snapshot
+           create/revert/delete restart the VM if it is running
+
+Settings (env vars): VM_CPUS=$CPUS VM_MEM=$MEM VM_DISK_SIZE=$DISK_SIZE VM_SSH_PORT=$SSH_PORT
+                     VM_USB="$USB_PASS" (host USB devices passed to the VM)
+EOF
+    ;;
+esac

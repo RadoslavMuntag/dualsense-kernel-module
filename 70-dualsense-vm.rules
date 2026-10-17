@@ -1,0 +1,3 @@
+# Let the logged-in user open the DualSense controller's raw USB node, so QEMU
+# (running unprivileged) can pass it through to the VM.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="054c", ATTR{idProduct}=="0ce6", TAG+="uaccess"

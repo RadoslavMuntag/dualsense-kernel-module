@@ -1,0 +1,52 @@
+# clangd setup for the kernel modules in this directory.
+#
+# The modules are built in the VM, against Ubuntu's kernel headers. clangd runs
+# on the host, so it reads a copy of those headers from kernel-headers/
+# (refresh it with: ./vm headers). The flags mirror the ones Ubuntu's kernel
+# build passes to gcc, minus the gcc-only options clang does not understand.
+CompileFlags:
+  Compiler: clang
+  Add:
+    - -xc
+    - -std=gnu11
+    - -nostdinc
+    - -I/home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/arch/x86/include
+    - -I/home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/arch/x86/include/generated
+    - -I/home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/include
+    - -I/home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/arch/x86/include/uapi
+    - -I/home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/arch/x86/include/generated/uapi
+    - -I/home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/include/uapi
+    - -I/home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/include/generated/uapi
+    - -I/home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/ubuntu/include
+    - -include
+    - /home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/include/linux/compiler-version.h
+    - -include
+    - /home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/include/linux/kconfig.h
+    - -include
+    - /home/namelessnovice/Work/ubuntu-vm/kernel-headers/current/include/linux/compiler_types.h
+    - -D__KERNEL__
+    - -DMODULE
+    - -DKBUILD_BASENAME="kmod"
+    - -DKBUILD_MODNAME="kmod"
+    - -D__KBUILD_MODNAME=kmod
+    - -fshort-wchar
+    - -funsigned-char
+    - -fno-strict-aliasing
+    - -fno-common
+    - -m64
+    - -mno-sse
+    - -mno-mmx
+    - -mno-sse2
+    - -mno-3dnow
+    - -mno-avx
+    - -mno-80387
+    - -mcmodel=kernel
+    - -mno-red-zone
+    - -O2
+    - -Wall
+    - -Wundef
+    - -Wno-sign-compare
+    - -Wno-pointer-sign
+    - -Wno-unknown-warning-option
+    - -Wno-gnu
+    - -Wno-address-of-packed-member
